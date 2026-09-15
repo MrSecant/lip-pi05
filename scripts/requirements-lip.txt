@@ -1,0 +1,2 @@
+# The source latent cache uses Zarr v3. Keep compatibility with openpi's NumPy <2.
+zarr==3.0.10

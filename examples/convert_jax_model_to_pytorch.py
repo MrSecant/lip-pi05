@@ -431,6 +431,10 @@ def convert_pi0_checkpoint(
         output_path: Path to save the converted PyTorch model
         model_config: Model config
     """
+    if hasattr(model_config, "lip_token_count"):
+        raise NotImplementedError(
+            "LIP prefix weights require an explicit PyTorch port and converter; use JAX for LIP inference"
+        )
     print(f"Converting PI0 checkpoint from {checkpoint_dir} to {output_path}")
     print(f"Model config: {model_config}")
 

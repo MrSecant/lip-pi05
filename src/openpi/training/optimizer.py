@@ -13,6 +13,14 @@ class LRScheduleConfig(Protocol):
 
 
 @dataclasses.dataclass(frozen=True)
+class ConstantSchedule(LRScheduleConfig):
+    lr: float = 1e-5
+
+    def create(self) -> optax.Schedule:
+        return optax.constant_schedule(self.lr)
+
+
+@dataclasses.dataclass(frozen=True)
 class CosineDecaySchedule(LRScheduleConfig):
     """Cosine decay schedule with warmup."""
 

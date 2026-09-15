@@ -7,7 +7,6 @@ from typing import Literal, Protocol, SupportsIndex, TypeVar
 
 import jax
 import jax.numpy as jnp
-import lerobot.common.datasets.lerobot_dataset as lerobot_dataset
 import numpy as np
 import torch
 
@@ -131,11 +130,32 @@ def create_torch_dataset(
     data_config: _config.DataConfig, action_horizon: int, model_config: _model.BaseModelConfig
 ) -> Dataset:
     """Create a dataset for training."""
+    if data_config.lip_cache_path is not None:
+        from openpi.lip_data import LipCacheDataset
+
+        dataset = LipCacheDataset(data_config.lip_cache_path, data_config.lip_split)
+        if (
+            model_config.state_dim != dataset.manifest["state_dim"]
+            or action_horizon != 32
+            or model_config.action_dim != 128
+        ):
+            raise ValueError("Model and task-specific LIP cache shapes disagree")
+        if data_config.lip_train_prompts or data_config.lip_eval_prompt is not None:
+            from openpi.lip_prompts import PromptedLipDataset
+
+            dataset = PromptedLipDataset(
+                dataset, train_prompts=data_config.lip_train_prompts,
+                eval_prompt=data_config.lip_eval_prompt, seed=data_config.lip_prompt_seed,
+            )
+        return dataset
+
     repo_id = data_config.repo_id
     if repo_id is None:
         raise ValueError("Repo ID is not set. Cannot create dataset.")
     if repo_id == "fake":
         return FakeDataset(model_config, num_samples=1024)
+
+    import lerobot.common.datasets.lerobot_dataset as lerobot_dataset
 
     dataset_meta = lerobot_dataset.LeRobotDatasetMetadata(repo_id)
     dataset = lerobot_dataset.LeRobotDataset(
@@ -159,6 +179,8 @@ def create_rlds_dataset(
     shuffle: bool = False,
 ) -> Dataset:
     # At the moment, we only support DROID for RLDS datasets.
+    from openpi.training.droid_rlds_dataset import DroidRldsDataset
+
     return DroidRldsDataset(
         data_dir=data_config.rlds_data_dir,
         batch_size=batch_size,
@@ -306,6 +328,16 @@ def create_torch_data_loader(
     # For PyTorch DDP, create DistributedSampler and divide batch size by world size
     # For JAX, divide by process count
     sampler = None
+    if data_config.lip_cache_path is not None and shuffle:
+        from openpi.lip_sampling import ReferenceStage2Sampler
+
+        sampler = ReferenceStage2Sampler(
+            len(dataset),
+            batch_size,
+            world_size=8,
+            rank_batch_size=int(dataset._dataset.manifest["stage2_config"]["train"]["batch_size"]),
+            include_epoch=bool(data_config.lip_train_prompts and data_config.lip_split == "train"),
+        )
     if framework == "pytorch":
         if torch.distributed.is_initialized():
             sampler = torch.utils.data.distributed.DistributedSampler(
@@ -534,6 +566,11 @@ class DataLoaderImpl(DataLoader):
 
     def data_config(self) -> _config.DataConfig:
         return self._data_config
+
+    def seek_lip_step(self, step: int):
+        if self._data_config.lip_cache_path is None:
+            raise ValueError("Only the LIP reference sampler supports exact step seeking")
+        self._data_loader.torch_loader.sampler.seek(step)
 
     def __iter__(self):
         for batch in self._data_loader:

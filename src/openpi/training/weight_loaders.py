@@ -55,6 +55,34 @@ class CheckpointWeightLoader(WeightLoader):
 
 
 @dataclasses.dataclass(frozen=True)
+class LipCheckpointWeightLoader(WeightLoader):
+    """Load backbone/time weights, initialize missing LoRA, and reset latent heads."""
+
+    params_path: str
+
+    def load(self, params: at.Params) -> at.Params:
+        loaded = _model.restore_params(download.maybe_download(self.params_path), restore_type=np.ndarray)
+        return merge_lip_weights(loaded, params)
+
+
+def merge_lip_weights(loaded, reference):
+    ref = flax.traverse_util.flatten_dict(reference, sep="/")
+    old = flax.traverse_util.flatten_dict(loaded, sep="/")
+    result = {}
+    for key, value in ref.items():
+        if key.startswith(("lip_prefix/", "action_in_proj/", "action_out_proj/")):
+            result[key] = value
+            continue
+        if key not in old and re.fullmatch(r"PaliGemma/llm/(?:.*/)?(?:.*_)?lora_[ab]", key):
+            result[key] = value
+            continue
+        if key not in old or old[key].shape != value.shape:
+            raise ValueError(f"Missing or shape-incompatible pretrained parameter: {key}")
+        result[key] = old[key].astype(value.dtype)
+    return flax.traverse_util.unflatten_dict(result, sep="/")
+
+
+@dataclasses.dataclass(frozen=True)
 class PaliGemmaWeightLoader(WeightLoader):
     """Loads weights from the official PaliGemma checkpoint.
 

@@ -6,6 +6,7 @@ import dataclasses
 import difflib
 import logging
 import pathlib
+import sys
 from typing import Any, Literal, Protocol, TypeAlias
 
 import etils.epath as epath
@@ -13,6 +14,8 @@ import flax.nnx as nnx
 from typing_extensions import override
 import tyro
 
+from openpi.lip_prompts import CUCUMBER_PROMPTS
+from openpi.models.lip_pi05 import LipPi05Config
 import openpi.models.model as _model
 import openpi.models.pi0_config as pi0_config
 import openpi.models.pi0_fast as pi0_fast
@@ -63,6 +66,11 @@ class AssetsConfig:
 
 @dataclasses.dataclass(frozen=True)
 class DataConfig:
+    lip_cache_path: str | None = None
+    lip_split: str = "train"
+    lip_train_prompts: tuple[str, ...] = ()
+    lip_eval_prompt: str | None = None
+    lip_prompt_seed: int = 42
     # LeRobot repo id. If None, fake data will be created.
     repo_id: str | None = None
     # Directory within the assets directory containing the data assets.
@@ -207,6 +215,36 @@ class FakeDataConfig(DataConfigFactory):
     @override
     def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
         return DataConfig(repo_id=self.repo_id)
+
+
+@dataclasses.dataclass(frozen=True)
+class LipDataConfig(DataConfigFactory):
+    repo_id: str = "lip"
+    cache_path: str = "./data/lip_condition_cache"
+    split: str = "train"
+    train_prompts: tuple[str, ...] = ()
+    eval_prompt: str | None = None
+    prompt_seed: int = 42
+
+    def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
+        if not isinstance(model_config, LipPi05Config):
+            raise ValueError("LIP data requires LipPi05Config")
+        return DataConfig(
+            repo_id="lip",
+            lip_cache_path=self.cache_path,
+            lip_split=self.split,
+            lip_train_prompts=self.train_prompts,
+            lip_eval_prompt=self.eval_prompt,
+            lip_prompt_seed=self.prompt_seed,
+            norm_stats={},
+            model_transforms=_transforms.Group(
+                inputs=[
+                    _transforms.TokenizePrompt(
+                        _tokenizer.PaligemmaTokenizer(model_config.max_token_len), discrete_state_input=True
+                    )
+                ]
+            ),
+        )
 
 
 @dataclasses.dataclass(frozen=True)
@@ -509,6 +547,14 @@ class TrainConfig:
     num_workers: int = 2
     # Number of train steps (batches) to run.
     num_train_steps: int = 30_000
+    lip_eval_every_epochs: int = 0
+    lip_eval_every_steps: int = 0
+    lip_eval_batch_size: int = 8
+    lip_eval_solvers: tuple[str, ...] = ()
+    lip_eval_sampling_steps: tuple[int, ...] = ()
+    lip_eval_on_resume: bool = False
+    lip_decoder_python: str = sys.executable
+    lip_decoder_device: str = "cpu"
 
     # How often (in steps) to log training metrics.
     log_interval: int = 100
@@ -558,6 +604,45 @@ class TrainConfig:
 
 # Use `get_config` if you need to get a config by name in your code.
 _CONFIGS = [
+    TrainConfig(
+        name="pi05_lip_cucumber_100k",
+        model=LipPi05Config(),
+        freeze_filter=nnx.Nothing,
+        data=LipDataConfig(train_prompts=CUCUMBER_PROMPTS, eval_prompt=CUCUMBER_PROMPTS[1]),
+        weight_loader=weight_loaders.LipCheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        # Match the official pi05_libero optimization recipe; only the run length differs.
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=10_000, peak_lr=5e-5, decay_steps=1_000_000, decay_lr=5e-5,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+        batch_size=128,
+        fsdp_devices=8,
+        num_workers=16,
+        num_train_steps=100_000,
+        lip_eval_every_steps=5_000,
+        lip_eval_batch_size=64,
+        lip_eval_solvers=("euler",),
+        lip_eval_sampling_steps=(8, 16),
+        lip_decoder_device="cuda:0",
+        log_interval=100,
+        save_interval=5_000,
+        keep_period=5_000,
+        checkpoint_base_dir="./checkpoints/pi05_lip",
+        wandb_enabled=False,
+    ),
+    TrainConfig(
+        name="pi05_lip_cucumber",
+        lip_eval_every_epochs=5,
+        model=LipPi05Config(),
+        data=LipDataConfig(),
+        weight_loader=weight_loaders.LipCheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        lr_schedule=_optimizer.ConstantSchedule(lr=1e-5),
+        ema_decay=None,
+        batch_size=8,  # Placeholder global batch; profile before a production run.
+        num_workers=2,
+        wandb_enabled=False,
+    ),
     #
     # Inference Aloha configs.
     #

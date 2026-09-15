@@ -217,6 +217,11 @@ def main(config: _config.TrainConfig):
     )
     init_wandb(config, resuming=resuming, enabled=config.wandb_enabled)
 
+    if getattr(config.data, "cache_path", None) is not None:
+        from openpi.training.lip_evaluation import write_run_assets
+
+        write_run_assets(config)
+
     data_loader = _data_loader.create_data_loader(
         config,
         sharding=data_sharding,
@@ -239,6 +244,11 @@ def main(config: _config.TrainConfig):
 
     if resuming:
         train_state = _checkpoints.restore_state(checkpoint_manager, train_state, data_loader)
+        if getattr(config.data, "cache_path", None) is not None:
+            data_iter = None
+            data_loader.seek_lip_step(int(train_state.step))
+            data_iter = iter(data_loader)
+            batch = next(data_iter)
 
     ptrain_step = jax.jit(
         functools.partial(train_step, config),
@@ -255,25 +265,68 @@ def main(config: _config.TrainConfig):
         dynamic_ncols=True,
     )
 
+    lip_logger = None
+    if getattr(config.data, "cache_path", None) is not None:
+        from openpi.training.lip_logging import LipRunLogger, steps_per_epoch
+
+        lip_logger = LipRunLogger(config.checkpoint_dir,
+            steps_per_epoch(config.data.cache_path, config.batch_size),
+            resume_step=start_step, log_interval=config.log_interval,
+            step_axis=config.lip_eval_every_steps > 0)
+    lr_schedule = config.lr_schedule.create()
     infos = []
-    for step in pbar:
-        with sharding.set_mesh(mesh):
-            train_state, info = ptrain_step(train_rng, train_state, batch)
-        infos.append(info)
-        if step % config.log_interval == 0:
-            stacked_infos = common_utils.stack_forest(infos)
-            reduced_info = jax.device_get(jax.tree.map(jnp.mean, stacked_infos))
-            info_str = ", ".join(f"{k}={v:.4f}" for k, v in reduced_info.items())
-            pbar.write(f"Step {step}: {info_str}")
-            wandb.log(reduced_info, step=step)
-            infos = []
-        batch = next(data_iter)
+    try:
+        if resuming and config.lip_eval_on_resume and start_step > 0:
+            from openpi.training.lip_evaluation import on_train_step
 
-        if (step % config.save_interval == 0 and step > start_step) or step == config.num_train_steps - 1:
-            _checkpoints.save_state(checkpoint_manager, train_state, data_loader, step)
+            logging.info("Evaluating restored checkpoint at step %s before training resumes", start_step)
+            lip_metrics = on_train_step(config, train_state, start_step)
+            if lip_metrics:
+                if lip_logger is not None:
+                    lip_logger.record_eval(start_step, lip_metrics)
+                wandb.log(lip_metrics, step=start_step - 1)
+                logging.info("LIP resumed evaluation at step %s: %s", start_step, lip_metrics)
+        for step in pbar:
+            with sharding.set_mesh(mesh):
+                train_state, info = ptrain_step(train_rng, train_state, batch)
+            infos.append(info)
+            if lip_logger is not None:
+                lip_logger.record_train(step + 1, jax.device_get(info), float(lr_schedule(step)))
+            if step % config.log_interval == 0:
+                stacked_infos = common_utils.stack_forest(infos)
+                reduced_info = jax.device_get(jax.tree.map(jnp.mean, stacked_infos))
+                info_str = ", ".join(f"{k}={v:.4f}" for k, v in reduced_info.items())
+                pbar.write(f"Step {step}: {info_str}")
+                wandb.log(reduced_info, step=step)
+                infos = []
+            batch = next(data_iter)
 
-    logging.info("Waiting for checkpoint manager to finish")
-    checkpoint_manager.wait_until_finished()
+            # Step-based LIP runs name checkpoints by completed updates, including the final 100000.
+            step_based = config.lip_eval_every_steps > 0
+            completed_step = step + 1
+            save_step = completed_step if step_based else step
+            should_save = (save_step % config.save_interval == 0 and save_step > start_step) or (
+                completed_step == config.num_train_steps)
+            if should_save:
+                if lip_logger is not None:
+                    lip_logger.save_progress(completed_step)
+                _checkpoints.save_state(checkpoint_manager, train_state, data_loader, save_step)
+
+            if config.lip_eval_every_epochs or config.lip_eval_every_steps:
+                from openpi.training.lip_evaluation import on_train_step
+
+                lip_metrics = on_train_step(config, train_state, step + 1)
+                if lip_metrics:
+                    if lip_logger is not None:
+                        lip_logger.record_eval(step + 1, lip_metrics)
+                    wandb.log(lip_metrics, step=step)
+                    logging.info("LIP evaluation at step %s: %s", step + 1, lip_metrics)
+
+        logging.info("Waiting for checkpoint manager to finish")
+        checkpoint_manager.wait_until_finished()
+    finally:
+        if lip_logger is not None:
+            lip_logger.close()
 
 
 if __name__ == "__main__":

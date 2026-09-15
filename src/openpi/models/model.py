@@ -17,7 +17,6 @@ import orbax.checkpoint as ocp
 import safetensors
 import torch
 
-from openpi.models_pytorch import pi0_pytorch
 from openpi.shared import image_tools
 import openpi.shared.array_typing as at
 
@@ -106,6 +105,12 @@ class Observation(Generic[ArrayT]):
     # Token loss mask (for FAST autoregressive model).
     token_loss_mask: at.Bool[ArrayT, "*b l"] | None = None
 
+    # Optional frozen LIP features and continuous state history (not future targets).
+    lip_visual: at.Float[ArrayT, "*b v p visual_d"] | None = None
+    lip_tactile: at.Float[ArrayT, "*b t tactile_n tactile_d"] | None = None
+    lip_proprio: at.Float[ArrayT, "*b t s"] | None = None
+    lip_mask: at.Bool[ArrayT, "*b lip_n"] | None = None
+
     @classmethod
     def from_dict(cls, data: at.PyTree[ArrayT]) -> "Observation[ArrayT]":
         """This method defines the mapping between unstructured data (i.e., nested dict) to the structured Observation format."""
@@ -126,6 +131,10 @@ class Observation(Generic[ArrayT]):
             tokenized_prompt_mask=data.get("tokenized_prompt_mask"),
             token_ar_mask=data.get("token_ar_mask"),
             token_loss_mask=data.get("token_loss_mask"),
+            lip_visual=data.get("lip_visual"),
+            lip_tactile=data.get("lip_tactile"),
+            lip_proprio=data.get("lip_proprio"),
+            lip_mask=data.get("lip_mask"),
         )
 
     def to_dict(self) -> at.PyTree[ArrayT]:
@@ -197,7 +206,8 @@ def preprocess_observation(
         else:
             out_masks[key] = jnp.asarray(observation.image_masks[key])
 
-    return Observation(
+    return dataclasses.replace(
+        observation,
         images=out_images,
         image_masks=out_masks,
         state=observation.state,
@@ -241,6 +251,8 @@ class BaseModelConfig(abc.ABC):
         return nnx.merge(graphdef, state)
 
     def load_pytorch(self, train_config, weight_path: str):
+        from openpi.models_pytorch import pi0_pytorch
+
         logger.info(f"train_config: {train_config}")
         model = pi0_pytorch.PI0Pytorch(config=train_config.model)
         safetensors.torch.load_model(model, weight_path)
