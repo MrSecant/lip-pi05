@@ -32,6 +32,7 @@ class LipPi05Config(Pi0Config):
     tactile_tokens_per_sensor: int = 2
     proprio_hidden_dim: int = 64
     visual_adapter_dim: int = 128
+    use_lip_visual: bool = True
     freeze_vision_encoder: bool = False
 
     def __post_init__(self):
@@ -45,7 +46,7 @@ class LipPi05Config(Pi0Config):
 
     @property
     def lip_token_count(self):
-        return self.visual_views * self.visual_tokens_per_view + self.history_frames * (
+        return (self.visual_views * self.visual_tokens_per_view if self.use_lip_visual else 0) + self.history_frames * (
             self.tactile_sensors * self.tactile_tokens_per_sensor + 1
         )
 
@@ -73,7 +74,7 @@ class LipPi05Config(Pi0Config):
             obs = dataclasses.replace(
                 obs,
                 state=spec((batch_size, self.state_dim)),
-                lip_visual=spec((batch_size, self.visual_views, 64, self.visual_dim)),
+                lip_visual=spec((batch_size, self.visual_views, 64, self.visual_dim)) if self.use_lip_visual else None,
                 lip_tactile=spec(
                     (
                         batch_size,
@@ -92,12 +93,13 @@ class LipPrefix(nnx.Module):
     def __init__(self, cfg, *, width, rngs):
         self.cfg = cfg
         self.width = width
-        self.visual_norm = nnx.LayerNorm(cfg.visual_dim, rngs=rngs)
-        self.visual_down = nnx.Linear(cfg.visual_dim, cfg.visual_adapter_dim, rngs=rngs)
-        self.visual_up = nnx.Linear(
-            cfg.visual_adapter_dim, cfg.visual_dim, kernel_init=nnx.initializers.zeros_init(), rngs=rngs
-        )
-        self.visual_proj = nnx.Linear(cfg.visual_dim, width, rngs=rngs)
+        if cfg.use_lip_visual:
+            self.visual_norm = nnx.LayerNorm(cfg.visual_dim, rngs=rngs)
+            self.visual_down = nnx.Linear(cfg.visual_dim, cfg.visual_adapter_dim, rngs=rngs)
+            self.visual_up = nnx.Linear(
+                cfg.visual_adapter_dim, cfg.visual_dim, kernel_init=nnx.initializers.zeros_init(), rngs=rngs
+            )
+            self.visual_proj = nnx.Linear(cfg.visual_dim, width, rngs=rngs)
         self.tactile_norm = nnx.LayerNorm(cfg.tactile_dim, rngs=rngs)
         self.tactile_proj = nnx.Linear(cfg.tactile_dim, width, rngs=rngs)
         self.proprio_norm = nnx.LayerNorm(cfg.state_dim, rngs=rngs)
@@ -118,30 +120,37 @@ class LipPrefix(nnx.Module):
             return nnx.Param(jax.random.normal(rngs.params(), shape) * 0.02)
 
         self.modality = emb((3, width))
-        self.view = emb((cfg.visual_views, width))
-        self.spatial = emb((64, width))
+        if cfg.use_lip_visual:
+            self.view = emb((cfg.visual_views, width))
+            self.spatial = emb((64, width))
         self.time = emb((cfg.history_frames, width))
         self.sensor = emb((cfg.tactile_sensors, width))
         self.sensor_position = emb((cfg.tactile_tokens_per_sensor, width))
 
     def __call__(self, obs):
         cfg = self.cfg
-        if any(x is None for x in (obs.lip_visual, obs.lip_tactile, obs.lip_proprio, obs.lip_mask)):
-            raise ValueError("LIP visual, tactile, proprio history and masks are required")
+        if any(x is None for x in (obs.lip_tactile, obs.lip_proprio, obs.lip_mask)):
+            raise ValueError("LIP tactile, proprio history and masks are required")
+        if cfg.use_lip_visual != (obs.lip_visual is not None):
+            raise ValueError("LIP visual input does not match use_lip_visual")
         b = obs.state.shape[0]
         expected = (
-            (b, cfg.visual_views, 64, cfg.visual_dim),
             (b, cfg.history_frames, cfg.tactile_sensors * cfg.tactile_tokens_per_sensor, cfg.tactile_dim),
             (b, cfg.history_frames, cfg.state_dim),
             (b, cfg.lip_token_count),
         )
         for value, shape in zip(
-            (obs.lip_visual, obs.lip_tactile, obs.lip_proprio, obs.lip_mask), expected, strict=True
+            (obs.lip_tactile, obs.lip_proprio, obs.lip_mask), expected, strict=True
         ):
             if value.shape != shape:
                 raise ValueError(f"LIP condition shape {value.shape} != {shape}")
-        visual = obs.lip_visual + self.visual_up(nnx.gelu(self.visual_down(self.visual_norm(obs.lip_visual))))
-        visual = self.visual_proj(visual) + self.view[None, :, None] + self.spatial[None, None] + self.modality[0]
+        parts = []
+        if cfg.use_lip_visual:
+            if obs.lip_visual.shape != (b, cfg.visual_views, 64, cfg.visual_dim):
+                raise ValueError("Invalid LIP visual shape")
+            visual = obs.lip_visual + self.visual_up(nnx.gelu(self.visual_down(self.visual_norm(obs.lip_visual))))
+            visual = self.visual_proj(visual) + self.view[None, :, None] + self.spatial[None, None] + self.modality[0]
+            parts.append(visual.reshape(b, -1, self.width))
         tactile = self.tactile_proj(self.tactile_norm(obs.lip_tactile)).reshape(
             b, cfg.history_frames, cfg.tactile_sensors, cfg.tactile_tokens_per_sensor, self.width
         )
@@ -150,9 +159,8 @@ class LipPrefix(nnx.Module):
         proprio = self.proprio_in(self.proprio_norm(obs.lip_proprio))
         proprio = proprio + self.proprio_pointwise(nnx.gelu(self.proprio_temporal(proprio)))
         proprio = self.proprio_out(proprio) + self.time[None] + self.modality[2]
-        tokens = jnp.concatenate(
-            (visual.reshape(b, -1, self.width), tactile.reshape(b, -1, self.width), proprio), axis=1
-        )
+        parts.extend((tactile.reshape(b, -1, self.width), proprio))
+        tokens = jnp.concatenate(parts, axis=1)
         return self.output_norm(tokens) * obs.lip_mask[..., None]
 
 

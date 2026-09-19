@@ -61,6 +61,8 @@ class LipPi05Policy:
     @classmethod
     def from_checkpoint(cls, params_path, *, config=None, tokenizer_path=None, jit=True):
         config = LipPi05Config() if config is None else config
+        if isinstance(config, Mapping):
+            config = LipPi05Config(**dict(config))
         if not isinstance(config, LipPi05Config):
             raise TypeError('Expected LipPi05Config, not the original robot-action Pi0Config')
         path = Path(params_path).expanduser().resolve()
@@ -88,10 +90,13 @@ class LipPi05Policy:
         batch = state.shape[0]
         shapes = {
             'state': (batch, cfg.state_dim),
-            'lip_visual': (batch, cfg.visual_views, 64, cfg.visual_dim),
             'lip_tactile': (batch, cfg.history_frames, cfg.tactile_sensors * cfg.tactile_tokens_per_sensor, cfg.tactile_dim),
             'lip_proprio': (batch, cfg.history_frames, cfg.state_dim),
         }
+        if cfg.use_lip_visual:
+            shapes['lip_visual'] = (batch, cfg.visual_views, 64, cfg.visual_dim)
+        elif inputs.get('lip_visual') is not None:
+            raise ValueError('No-visual policy must not receive extra Stage1 visual tokens')
         data = {}
         for key, shape in shapes.items():
             value = np.asarray(inputs[key], dtype=np.float32)
