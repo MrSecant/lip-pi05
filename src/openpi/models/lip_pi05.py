@@ -17,8 +17,9 @@ from openpi.shared import nnx_utils
 
 @dataclasses.dataclass(frozen=True)
 class LipPi05Config(Pi0Config):
+    target_space: str = "joint_latent"
     pi05: bool = True
-    action_dim: int = 128  # Internal expert output is a latent, never a robot state.
+    action_dim: int = 128  # Latent channels, or 32 padded channels in raw-action mode.
     action_horizon: int = 32
     state_dim: int = 14
     decoded_action_horizon: int = 128
@@ -37,6 +38,12 @@ class LipPi05Config(Pi0Config):
 
     def __post_init__(self):
         super().__post_init__()
+        if self.target_space not in ("joint_latent", "raw_action"):
+            raise ValueError("target_space must be joint_latent or raw_action")
+        if self.target_space == "raw_action" and (
+            self.action_dim != 32 or self.action_horizon != 128 or self.temporal_downsample != 1
+        ):
+            raise ValueError("Raw-action v1 uses 128 frames, 14 joints padded to the native 32 channels")
         if not self.pi05 or not self.discrete_state_input:
             raise ValueError("LIP Pi0.5 retains the native discrete current-state interface")
         if self.action_horizon * self.temporal_downsample != self.decoded_action_horizon:
